@@ -156,3 +156,41 @@ key2 下使用其对应单 launch 实现。tiling key 和私有 `stage` 均不�
 - Shape：`K=V=64` 或 `K=V=128`（两档且必须同档，混合档与其它取值由参数校验拒绝），
   chunk=64/128，dense/varlen/tail/GQA。
 - 属性：final state、重计算策略、`state_v_first`。
+
+## L0C ping-pong + Fixpipe 异步化（FwdH，来源：chunk_kda_fwd-最优优化方案.md）
+
+### 依据与前提核实
+外部方案基于 msopprof 流水图（E_t1024_h8_hv96，493.28us，Cube Scalar 52.09%）。
+逐条核实源码后确认前提成立：
+- 中间量（qk/kk/inverse/update/out）走 `PackedTileCopyTlaToUB`（L0C→UB），
+  未落地 GM；方案修正了 profiling 报告"Fixpipe=L0C→GM"的误读。
+- `hv96` 是 V head 数，arch35 前置 `kDim==vDim==128`，Fixpipe 128 列无浪费。
+- Scalar 52% 的主体是 `WaitFlag<FIX_M>` 等 Fixpipe（在 PIPE_S 上计费），
+  不是循环控制/地址计算。
+
+### 改动
+`ComputePostWuAic` / `ComputeStateProductsAic` / `ComputeVnewProductsAic`：
+- L0C 由单缓冲改 2 slot（每 slot 64KB，A5 L0C 256KB），按 **MMAD 写入次数**
+  经 `NextL0CSlot()` 交替（不是按 chunk 或 publish——PostWu 的两次子块 publish
+  共享同一次写入，必须同 slot）。
+- 下一次 MMAD 写 slot N+1 与 slot N 的 Fixpipe 排空重叠；删除调用点的
+  `WaitFlag<FIX_M>`（改走 `WaitL0CFixDone()`）。
+- 安全性：slot N 在复用前，必经下一次 publish 开头的 `WaitDirectFreeAic()`；
+  它由 AIV 的 `SetDirectFreeAiv` 驱动，而后者只可能在 `SetDirectReadyAic`
+  （PIPE_FIX，排在 `copyL0CToDst` 之后）之后发生，故 slot N 的 Fixpipe 已排空。
+  **跨核 READY/FREE flag 协议一字未改**，不触碰任务游标/除法（R8/R9 回归雷区）。
+- `SetFlag<FIX_M>` 随 `WaitFlag` 一起在 pingpong 模式跳过，避免残留未消费 event。
+
+### A/B 开关
+host 读 `RKDA_FWDH_L0C_PINGPONG`（缺省 1，=0 关闭），经 tiling 字段
+`l0cPingpong` 下发。同一二进制：`=0` 完全恢复单缓冲 + `WaitFlag<FIX_M>` 基线
+（`NextL0CSlot()` 恒返回 0、`SetFlag`/`WaitFlag<FIX_M>` 成对恢复）。
+
+### 数值与验收
+- 只改 L0C 缓冲 slot 与等待时机，零算术变化，逐位一致由构造保证。
+- 验收口径：`msopprof` op_summary Task Duration（目标 493→370-410us）+
+  Cube Scalar pipe 占比（目标 52%→30-35%）；A/B = 本改动 vs 父 commit，
+  `RKDA_FWDH_L0C_PINGPONG` 0/1 同二进制对照。
+- 边界：case 必须走 `useDenseFwdH`（dense 且 q 为 bf16）；否则走通用后端，本改动不生效。
+- 本机无 CANN/NPU，**未编译未实测**；收益数字均为方案估算，以设备实测为准。
+- 回退：`git revert` 单 commit 即可；或临时 `RKDA_FWDH_L0C_PINGPONG=0` 验证基线。

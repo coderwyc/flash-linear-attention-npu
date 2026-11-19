@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include "platform/soc_spec.h"
 #include <register/op_impl_registry.h>
@@ -383,6 +384,10 @@ ge::graphStatus Tiling4ChunkKdaFwd(gert::TilingContext *context)
     tiling.set_hWorkspaceOffset(hWorkspaceOffset);
     tiling.set_numSeqWorkspaceOffset(numSeqWorkspaceOffset);
     tiling.set_numChunksWorkspaceOffset(numChunksWorkspaceOffset);
+    // Single-variable A/B: RKDA_FWDH_L0C_PINGPONG=0 restores the baseline
+    // single-buffer + WaitFlag<FIX_M> timing in the same binary. Default on.
+    const char *l0cPpEnv = std::getenv("RKDA_FWDH_L0C_PINGPONG");
+    tiling.set_l0cPingpong(l0cPpEnv == nullptr || std::strcmp(l0cPpEnv, "0") != 0);
     tiling.SaveToBuffer(context->GetRawTilingData()->GetData(),
                         context->GetRawTilingData()->GetCapacity());
     context->GetRawTilingData()->SetDataSize(tiling.GetDataSize());

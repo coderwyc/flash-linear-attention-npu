@@ -67,6 +67,8 @@ TILING_DATA_FIELD_DEF(int64_t, kDecayWorkspaceOffset);
 TILING_DATA_FIELD_DEF(int64_t, hWorkspaceOffset);
 TILING_DATA_FIELD_DEF(int64_t, numSeqWorkspaceOffset);
 TILING_DATA_FIELD_DEF(int64_t, numChunksWorkspaceOffset);
+// L0C ping-pong switch: 1 (default) = two-slot Fixpipe overlap, 0 = baseline.
+TILING_DATA_FIELD_DEF(bool, l0cPingpong);
 END_TILING_DATA_DEF;
 
 REGISTER_TILING_DATA_CLASS(ChunkKdaFwd, ChunkKdaFwdTilingData)

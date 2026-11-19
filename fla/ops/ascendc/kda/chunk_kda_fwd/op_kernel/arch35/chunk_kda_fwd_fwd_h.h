@@ -71,6 +71,14 @@ constexpr uint32_t KDA_FWD_H_L0B_STATE_OFFSET = 0;
 constexpr uint32_t KDA_FWD_H_L0B_VNEW_OFFSET = 32 * 1024;
 constexpr uint32_t KDA_FWD_H_L0B_POST_OFFSET = 32 * 1024;
 
+// L0C ping-pong (L0C_PINGPONG). Widest tile is the 64x256 post-wu result
+// (64 * 256 * sizeof(float) = 64KB); A5 L0C is 256KB so two slots fit.
+// Two slots let the next MMAD write slot N+1 while slot N's Fixpipe is still
+// draining, removing the scalar stall at WaitFlag<FIX_M>. Slot is picked per
+// MMAD write (not per chunk / per publish): the two post-wu sub-block
+// publishes share one write and must select the same slot.
+constexpr uint32_t KDA_FWD_H_L0C_SLOT_BYTES = 64 * 1024;
+
 constexpr uint32_t KDA_FWD_H_UB_STATE_OFFSET = 0;
 constexpr uint32_t KDA_FWD_H_UB_STATE_TYPED_OFFSET = 32 * 1024;
 constexpr uint32_t KDA_FWD_H_UB_DIRECT_OFFSET = 48 * 1024;
@@ -129,6 +137,8 @@ public:
         statePublishCount_[1] = 0;
         vnewPublishCount_[0] = 0;
         vnewPublishCount_[1] = 0;
+        l0cWriteIndex_ = 0;
+        l0cPingpong_ = tiling.l0cPingpong;
     }
 
     __aicore__ inline void Process()
@@ -315,7 +325,12 @@ private:
         WaitFlag<HardEvent::M_FIX>(mToFixEvent);
         copyL0CToDst(tensorUb, tensorL0C);
         SetDirectReadyAic();
-        SetFlag<HardEvent::FIX_M>(fixToMEvent);
+        // In ping-pong mode no one waits on FIX_M (cross-core PIPE_FIX
+        // handshake above already covers drain), so skip setting the flag to
+        // avoid leaving an unconsumed event. Baseline keeps the pair.
+        if (!l0cPingpong_) {
+            SetFlag<HardEvent::FIX_M>(fixToMEvent);
+        }
     }
 
     template <typename DirectTileCopy>
@@ -327,6 +342,34 @@ private:
         auto tensorL0C = tla::MakeTensor(l0C, layoutL0C, Catlass::Arch::PositionL0C{});
         PublishDirectTile<DirectTileCopy>(
             tensorL0C, m, n, mToFixEvent, fixToMEvent);
+    }
+
+    // L0C ping-pong helpers. slot is picked per MMAD write (not per chunk and
+    // not per publish): the two post-wu sub-block publishes share one write.
+    __aicore__ inline uint32_t NextL0CSlot()
+    {
+        if (!l0cPingpong_) {
+            return 0;  // A/B=0: single buffer, exact baseline timing
+        }
+        return (l0cWriteIndex_++) & 1;
+    }
+
+    __aicore__ inline LocalTensor<float> GetL0CBySlot(uint32_t slot)
+    {
+        return resource_.l0CBuf.template GetBufferByByte<float>(
+            slot * KDA_FWD_H_L0C_SLOT_BYTES);
+    }
+
+    __aicore__ inline void WaitL0CFixDone()
+    {
+        // ping-pong: the cross-core direct-buffer handshake at the next
+        // publish (WaitDirectFreeAic, fed by SetDirectReadyAic on PIPE_FIX,
+        // which waits copyL0CToDst to drain) already guarantees the previous
+        // Fixpipe of this slot completed before the slot is reused.
+        // single-buffer fallback keeps the original in-core FIX_M wait.
+        if (!l0cPingpong_) {
+            WaitFlag<HardEvent::FIX_M>(aicFixToMEvent_);
+        }
     }
 
     __aicore__ inline void PrefetchIndependentProductsAic(
@@ -437,7 +480,8 @@ private:
             KDA_FWD_H_L0A_POST_OFFSET);
         LocalTensor<T> l0B = resource_.l0BBuf.template GetBufferByByte<T>(
             KDA_FWD_H_L0B_POST_OFFSET);
-        LocalTensor<float> l0C = resource_.l0CBuf.template GetBufferByByte<float>(0);
+        const uint32_t l0cSlot = NextL0CSlot();
+        LocalTensor<float> l0C = GetL0CBySlot(l0cSlot);
 
         auto tensorL1Akk = tla::MakeTensor(
             l1Akk, tla::MakeLayout<T, LayoutTagL1A>(KDA_FWD_H_CHUNK, KDA_FWD_H_CHUNK),
@@ -491,11 +535,11 @@ private:
         PublishDirectTile<DirectTileCopyRM>(
             tileL0CW, KDA_FWD_H_CHUNK, KDA_FWD_H_DIM,
             aicMToFixEvent_, aicFixToMEvent_);
-        WaitFlag<HardEvent::FIX_M>(aicFixToMEvent_);
+        WaitL0CFixDone();
         PublishDirectTile<DirectTileCopyRM>(
             tileL0CU, KDA_FWD_H_CHUNK, KDA_FWD_H_DIM,
             aicMToFixEvent_, aicFixToMEvent_);
-        WaitFlag<HardEvent::FIX_M>(aicFixToMEvent_);
+        WaitL0CFixDone();
     }
 
     __aicore__ inline void ComputeStateProductsAic(
@@ -520,7 +564,10 @@ private:
             KDA_FWD_H_L0A_STATE_OFFSET);
         LocalTensor<T> l0B = resource_.l0BBuf.template GetBufferByByte<T>(
             KDA_FWD_H_L0B_STATE_OFFSET);
-        LocalTensor<float> l0C = resource_.l0CBuf.template GetBufferByByte<float>(0);
+        const uint32_t l0cSlot0 = NextL0CSlot();
+        const uint32_t l0cSlot1 = NextL0CSlot();
+        LocalTensor<float> l0C0 = GetL0CBySlot(l0cSlot0);
+        LocalTensor<float> l0C1 = GetL0CBySlot(l0cSlot1);
 
         auto layoutL1A = tla::MakeLayout<T, LayoutTagL1A>(KDA_FWD_H_CHUNK, KDA_FWD_H_DIM);
         auto layoutL1B = tla::MakeLayout<T, LayoutTagL1B>(KDA_FWD_H_DIM, KDA_FWD_H_DIM);
@@ -532,7 +579,8 @@ private:
         auto tensorL1B = tla::MakeTensor(l1B, layoutL1B, Catlass::Arch::PositionL1{});
         auto tensorL0A = tla::MakeTensor(l0A, layoutL0A, Catlass::Arch::PositionL0A{});
         auto tensorL0B = tla::MakeTensor(l0B, layoutL0B, Catlass::Arch::PositionL0B{});
-        auto tensorL0C = tla::MakeTensor(l0C, layoutL0C, Catlass::Arch::PositionL0C{});
+        auto tensorL0C0 = tla::MakeTensor(l0C0, layoutL0C, Catlass::Arch::PositionL0C{});
+        auto tensorL0C1 = tla::MakeTensor(l0C1, layoutL0C, Catlass::Arch::PositionL0C{});
         auto tileL1B = GetTile(tensorL1B, tla::MakeCoord(0, 0),
                                tla::MakeShape(KDA_FWD_H_DIM, KDA_FWD_H_DIM));
         auto tileL0A = GetTile(tensorL0A, tla::MakeCoord(0, 0),
@@ -543,8 +591,10 @@ private:
                                tla::MakeShape(KDA_FWD_H_CHUNK, KDA_FWD_H_DIM));
         auto tileL0B = GetTile(tensorL0B, tla::MakeCoord(0, 0),
                                tla::MakeShape(KDA_FWD_H_DIM, KDA_FWD_H_DIM));
-        auto tileL0C = GetTile(tensorL0C, tla::MakeCoord(0, 0),
-                               tla::MakeShape(KDA_FWD_H_CHUNK, KDA_FWD_H_DIM));
+        auto tileL0C0 = GetTile(tensorL0C0, tla::MakeCoord(0, 0),
+                                tla::MakeShape(KDA_FWD_H_CHUNK, KDA_FWD_H_DIM));
+        auto tileL0C1 = GetTile(tensorL0C1, tla::MakeCoord(0, 0),
+                                tla::MakeShape(KDA_FWD_H_CHUNK, KDA_FWD_H_DIM));
 
         CopyL1ToL0A copyL1ToL0A;
         CopyL1ToL0B copyL1ToL0B;
@@ -558,26 +608,26 @@ private:
         copyL1ToL0B(tileL0B, tileL1B);
         SetFlag<HardEvent::MTE1_M>(aicMte1ToMEvent_);
         WaitFlag<HardEvent::MTE1_M>(aicMte1ToMEvent_);
-        tileMmad(tileL0C, tileL0A, tileL0B, KDA_FWD_H_CHUNK,
+        tileMmad(tileL0C0, tileL0A, tileL0B, KDA_FWD_H_CHUNK,
                  KDA_FWD_H_DIM, KDA_FWD_H_DIM, true, 0);
         SetFlag<HardEvent::M_MTE1>(stateL0FreeEvent_);
         PublishDirect<DirectTileCopyRM>(
-            l0C, KDA_FWD_H_CHUNK, KDA_FWD_H_DIM,
+            l0C0, KDA_FWD_H_CHUNK, KDA_FWD_H_DIM,
             aicMToFixEvent_, aicFixToMEvent_);
         SetL1SlotFlagAicToAiv<PIPE_FIX>(KDA_FWD_H_STATE_FREE_FLAG);
 
         WaitFlag<HardEvent::M_MTE1>(stateL0FreeEvent_);
-        WaitFlag<HardEvent::FIX_M>(aicFixToMEvent_);
+        WaitL0CFixDone();
         copyL1ToL0A(tileL0A, tileL1Q);
         SetFlag<HardEvent::MTE1_M>(aicMte1ToMEvent_);
         WaitFlag<HardEvent::MTE1_M>(aicMte1ToMEvent_);
-        tileMmad(tileL0C, tileL0A, tileL0B, KDA_FWD_H_CHUNK,
+        tileMmad(tileL0C1, tileL0A, tileL0B, KDA_FWD_H_CHUNK,
                  KDA_FWD_H_DIM, KDA_FWD_H_DIM, true, 0);
         SetFlag<HardEvent::M_MTE1>(stateL0FreeEvent_);
         PublishDirect<DirectTileCopyRM>(
-            l0C, KDA_FWD_H_CHUNK, KDA_FWD_H_DIM,
+            l0C1, KDA_FWD_H_CHUNK, KDA_FWD_H_DIM,
             aicMToFixEvent_, aicFixToMEvent_);
-        WaitFlag<HardEvent::FIX_M>(aicFixToMEvent_);
+        WaitL0CFixDone();
     }
 
     __aicore__ inline void ComputeVnewProductsAic(
@@ -608,7 +658,10 @@ private:
             KDA_FWD_H_L0A_VNEW_OFFSET);
         LocalTensor<T> l0B = resource_.l0BBuf.template GetBufferByByte<T>(
             KDA_FWD_H_L0B_VNEW_OFFSET);
-        LocalTensor<float> l0C = resource_.l0CBuf.template GetBufferByByte<float>(0);
+        const uint32_t l0cSlot0 = NextL0CSlot();
+        const uint32_t l0cSlot1 = NextL0CSlot();
+        LocalTensor<float> l0C0 = GetL0CBySlot(l0cSlot0);
+        LocalTensor<float> l0C1 = GetL0CBySlot(l0cSlot1);
 
         auto layoutL1Kg = tla::MakeLayout<T, LayoutTagL1AK>(KDA_FWD_H_DIM, KDA_FWD_H_CHUNK);
         auto layoutL1Aqk = tla::MakeLayout<T, LayoutTagL1AA>(KDA_FWD_H_CHUNK, KDA_FWD_H_CHUNK);
@@ -623,10 +676,10 @@ private:
         auto baseL0Aqk = tla::MakeTensor(l0A, layoutL0Aqk, Catlass::Arch::PositionL0A{});
         auto baseL0V = tla::MakeTensor(l0B, layoutL0V, Catlass::Arch::PositionL0B{});
         auto baseL0Update = tla::MakeTensor(
-            l0C, tla::MakeLayoutL0C(KDA_FWD_H_DIM, KDA_FWD_H_DIM),
+            l0C0, tla::MakeLayoutL0C(KDA_FWD_H_DIM, KDA_FWD_H_DIM),
             Catlass::Arch::PositionL0C{});
         auto baseL0Out = tla::MakeTensor(
-            l0C, tla::MakeLayoutL0C(KDA_FWD_H_CHUNK, KDA_FWD_H_DIM),
+            l0C1, tla::MakeLayoutL0C(KDA_FWD_H_CHUNK, KDA_FWD_H_DIM),
             Catlass::Arch::PositionL0C{});
         auto tensorL1Kg = GetTile(baseL1Kg, tla::MakeCoord(0, 0),
                                   tla::MakeShape(KDA_FWD_H_DIM, KDA_FWD_H_CHUNK));
@@ -660,12 +713,12 @@ private:
                   KDA_FWD_H_DIM, KDA_FWD_H_DIM, KDA_FWD_H_CHUNK, true, 0);
         SetFlag<HardEvent::M_MTE1>(vnewL0FreeEvent_);
         PublishDirect<DirectTileCopyCM>(
-            l0C, KDA_FWD_H_DIM, KDA_FWD_H_DIM,
+            l0C0, KDA_FWD_H_DIM, KDA_FWD_H_DIM,
             aicMToFixEvent_, aicFixToMEvent_);
         SetL1SlotFlagAicToAiv<PIPE_FIX>(KDA_FWD_H_VNEW_FREE_FLAG);
 
         WaitFlag<HardEvent::M_MTE1>(vnewL0FreeEvent_);
-        WaitFlag<HardEvent::FIX_M>(aicFixToMEvent_);
+        WaitL0CFixDone();
         copyL1ToL0AA(tensorL0Aqk, tensorL1Aqk);
         SetFlag<HardEvent::MTE1_MTE2>(aicL1ReuseEvents_[slot]);
         if (prefetchNext) {
@@ -677,9 +730,9 @@ private:
                   KDA_FWD_H_CHUNK, KDA_FWD_H_DIM, KDA_FWD_H_CHUNK, true, 0);
         SetFlag<HardEvent::M_MTE1>(vnewL0FreeEvent_);
         PublishDirect<DirectTileCopyRM>(
-            l0C, KDA_FWD_H_CHUNK, KDA_FWD_H_DIM,
+            l0C1, KDA_FWD_H_CHUNK, KDA_FWD_H_DIM,
             aicMToFixEvent_, aicFixToMEvent_);
-        WaitFlag<HardEvent::FIX_M>(aicFixToMEvent_);
+        WaitL0CFixDone();
     }
 
     __aicore__ inline void ProcessAic()
@@ -1002,6 +1055,8 @@ private:
     bool storeVNew_ = false;
     bool storeH_ = false;
     bool fusePostWuIntoFwdH_ = false;
+    uint32_t l0cWriteIndex_ = 0;
+    bool l0cPingpong_ = true;
 };
 
 } // namespace KdaForward::arch35
