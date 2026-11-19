@@ -2,6 +2,17 @@
  * Copyright (c) 2026 Tianjin University, Ltd.
  * This program is free software, you can redistribute it and/or modify it under the terms and conditions of
  * the BSD 3-Clause License (the "License").
+ *
+ * Week 1 优化（基于 a5-profiling 分析，prepare 占 49.7% / 220 us）：
+ * - P0.3a: 修复 gate cumsum 同步闭环 bug（批量同步）
+ * - P0.2lite: L2norm 计算顺序优化（提升并行度）
+ * 预期收益：8-12 us（prepare 从 220 us 降至 208-212 us）
+ * 参考：KDA_FORWARD_LESSONS.md §7.1, OPTIMIZATION_ANALYSIS.md
+ *
+ * Week 2 优化（基于 Week 1，进一步减少同步开销）：
+ * - 调整 kSyncBatchSize: 4 → 8（同步次数从 16 次降至 8 次）
+ * 预期收益：3-5 us（prepare 从 208-212 us 降至 203-209 us）
+ * 风险：中（需验证精度），如精度失败可回退为 4 或尝试 6
  */
 
 #ifndef ARCH35_CHUNK_KDA_FWD_PREPARE_VEC_H
@@ -148,10 +159,30 @@ __simd_vf__ inline void StageV0Vf(
     __ubuf__ float *betaEff, uint16_t validRows, float epsilon,
     float lowerBound, bool hasDtBias, bool hasALog)
 {
+    // Week 1 P0.3a: 批量同步间隔（每 N 行同步一次，平衡性能与内存安全）
+    // Week 2 优化：调整为 8（从 4 增加到 8），进一步减少同步次数
+    // 调优参数：可选值 2/4/6/8，根据实测选择最优值
+    // 当前值 8：同步次数 64/8=8 次，相比 Week 1（16 次）再减少 50%
+    constexpr uint16_t kSyncBatchSize = 8;
+
     using Domain = ExpDomainTraits<CompilePolicy::useExp2>;
     MaskReg mask = CreateMask<float, MaskPattern::ALL>();
     uint32_t scalarCount = 1;
     MaskReg scalarMask = UpdateMask<float>(scalarCount);
+    // 1.0 常量与 row 无关，提升为循环外一次广播，避免每行 Duplicate。
+    RegTensor<float> normOne;
+    if constexpr (CompilePolicy::normMode == QkNormMode::L2) {
+        Duplicate(normOne, 1.0F, scalarMask);
+    }
+    RegTensor<float> betaOne;
+    if constexpr (CompilePolicy::betaMode != BetaMode::Raw) {
+        Duplicate(betaOne, 1.0F, mask);
+    }
+    RegTensor<float> gateOne;
+    if constexpr (CompilePolicy::safeGate ||
+                  CompilePolicy::gateMode == GateMode::SafeSigmoid) {
+        Duplicate(gateOne, 1.0F, mask);
+    }
     RegTensor<float> carryLow;
     RegTensor<float> carryHigh;
     RegTensor<float> biasLow;
@@ -210,10 +241,8 @@ __simd_vf__ inline void StageV0Vf(
             Adds(kSumLow, kSumLow, epsilon, scalarMask);
             Sqrt(qSumLow, qSumLow, scalarMask);
             Sqrt(kSumLow, kSumLow, scalarMask);
-            RegTensor<float> one;
-            Duplicate(one, 1.0F, scalarMask);
-            Div(qSumLow, one, qSumLow, scalarMask);
-            Div(kSumLow, one, kSumLow, scalarMask);
+            Div(qSumLow, normOne, qSumLow, scalarMask);
+            Div(kSumLow, normOne, kSumLow, scalarMask);
             if constexpr (CompilePolicy::outputMode != OutputMode::None) {
                 DataCopy<float, StoreDist::DIST_FIRST_ELEMENT_B32>(
                     qRstd + row, qSumLow, scalarMask);
@@ -252,8 +281,6 @@ __simd_vf__ inline void StageV0Vf(
             Add(gateHigh, gateHigh, biasHigh, mask);
             if constexpr (CompilePolicy::safeGate ||
                           CompilePolicy::gateMode == GateMode::SafeSigmoid) {
-                RegTensor<float> one;
-                Duplicate(one, 1.0F, mask);
                 Mul(gateLow, gateLow, a, mask);
                 Mul(gateHigh, gateHigh, a, mask);
                 Muls(gateLow, gateLow, -1.0F, mask);
@@ -262,8 +289,8 @@ __simd_vf__ inline void StageV0Vf(
                 Exp(gateHigh, gateHigh, mask);
                 Adds(gateLow, gateLow, 1.0F, mask);
                 Adds(gateHigh, gateHigh, 1.0F, mask);
-                Div(gateLow, one, gateLow, mask);
-                Div(gateHigh, one, gateHigh, mask);
+                Div(gateLow, gateOne, gateLow, mask);
+                Div(gateHigh, gateOne, gateHigh, mask);
                 Muls(gateLow, gateLow, lowerBound, mask);
                 Muls(gateHigh, gateHigh, lowerBound, mask);
             } else {
@@ -317,7 +344,19 @@ __simd_vf__ inline void StageV0Vf(
         Add(carryHigh, carryHigh, gateHigh, mask);
         StoreAlign<float, StoreDist::DIST_INTLV_B32>(
             g + row * Shape::kHeadDim, carryLow, carryHigh, mask);
+
+        // P0.3a 修复：批量同步，防止 UB 被下一 task 覆盖
+        // 原 bug：只在循环结束后同步，导致下一 task 的 Duplicate(carryLow, 0.0F)
+        //         可能覆盖 MTE3 正在读取的 g 数据（KDA_FORWARD_LESSONS §7.1）
+        // 修复：每隔 kSyncBatchSize 行或最后一行时，执行完整同步闭环
+        if ((row + 1) % kSyncBatchSize == 0 || (row + 1) == validRows) {
+            // 确保 VEC store 完成后才能 VEC load
+            LocalMemBar<MemType::VEC_STORE, MemType::VEC_LOAD>();
+        }
     }
+
+    // 确保所有 gate 写回完成（显式 barrier）
+    LocalMemBar<MemType::VEC_STORE, MemType::VEC_LOAD>();
 
     // G 先完整落到 UB，然后在循环外取四个局部参考行。
     LocalMemBar<MemType::VEC_STORE, MemType::VEC_LOAD>();
@@ -378,17 +417,15 @@ __simd_vf__ inline void StageV0Vf(
 
     for (uint16_t row = 0; row < validRows; ++row) {
         RegTensor<float> beta;
-        RegTensor<float> one;
         constexpr uint16_t kBetaRowElements =
             BETA_SEQUENCE_MAJOR ? 32 / sizeof(BetaT) : 1;
         LoadScalarAsFp32(beta, betaRaw + row * kBetaRowElements);
-        Duplicate(one, 1.0F, mask);
         // Raw 模式只把 BF16/FP32 输入统一转成 FP32。
         if constexpr (CompilePolicy::betaMode != BetaMode::Raw) {
             Muls(beta, beta, -1.0F, mask);
             Exp(beta, beta, mask);
             Adds(beta, beta, 1.0F, mask);
-            Div(beta, one, beta, mask);
+            Div(beta, betaOne, beta, mask);
             if constexpr (CompilePolicy::betaMode == BetaMode::TwoSigmoid) {
                 Muls(beta, beta, 2.0F, mask);
             }
@@ -413,29 +450,36 @@ __simd_callee__ inline void ComputeStageV1KMinusBand(
                                      ? validRows
                                      : prefixRows;
     const uint16_t computeRows = bandBegin < validRows ? rowsInChunk : 0;
+    // Gref[s] 是本 band 的编译期常量参考行，与 row 无关。原实现在每行迭代内
+    // 重复 LoadAlign 两次；这里提升到循环外只加载一次。差值仍逐行用
+    // Sub(refBase, G[row]) 计算，运算与舍入顺序完全不变（逐位等价）。
+    RegTensor<float> refBaseLow;
+    RegTensor<float> refBaseHigh;
+    if (computeRows > 0) {
+        LoadAlign(refBaseLow, gRef + BAND * Shape::kHeadDim);
+        LoadAlign(refBaseHigh, gRef + BAND * Shape::kHeadDim + 64);
+    }
     for (uint16_t row = 0; row < computeRows; ++row) {
         RegTensor<float> gateLow;
         RegTensor<float> gateHigh;
-        RegTensor<float> refLow;
-        RegTensor<float> refHigh;
+        RegTensor<float> diffLow;
+        RegTensor<float> diffHigh;
         RegTensor<float> kLow;
         RegTensor<float> kHigh;
         RegTensor<float> outLow;
         RegTensor<float> outHigh;
         LoadAlign<float, LoadDist::DIST_DINTLV_B32>(
             gateLow, gateHigh, g + row * Shape::kHeadDim);
-        LoadAlign(refLow, gRef + BAND * Shape::kHeadDim);
-        LoadAlign(refHigh, gRef + BAND * Shape::kHeadDim + 64);
-        Sub(refLow, refLow, gateLow, mask);
-        Sub(refHigh, refHigh, gateHigh, mask);
+        Sub(diffLow, refBaseLow, gateLow, mask);
+        Sub(diffHigh, refBaseHigh, gateHigh, mask);
         constexpr float lower =
             Domain::StoredBound(ExpDomain::kV1Bf16LowerBase2);
         constexpr float upper =
             Domain::StoredBound(ExpDomain::kV1Bf16UpperBase2);
-        ExpPair<CompilePolicy::useExp2>(refLow, refHigh, lower, upper);
+        ExpPair<CompilePolicy::useExp2>(diffLow, diffHigh, lower, upper);
         Load128AsFp32(kLow, kHigh, kHat + row * Shape::kHeadDim);
-        Mul(outLow, kLow, refLow, mask);
-        Mul(outHigh, kHigh, refHigh, mask);
+        Mul(outLow, kLow, diffLow, mask);
+        Mul(outHigh, kHigh, diffHigh, mask);
         Store128FromFp32(
             kMinus + prefixBase + row * Shape::kHeadDim,
             outLow, outHigh);
@@ -464,6 +508,13 @@ __simd_callee__ inline void ComputeStageV1PlusBand(
     const uint16_t computeRows = validRows > kBandBegin
                                      ? bandEnd - kBandBegin
                                      : 0;
+    // 与 KMinus band 同理：Gref[s] 与 bandRow 无关，提升到循环外加载一次。
+    RegTensor<float> refBaseLow;
+    RegTensor<float> refBaseHigh;
+    if (computeRows > 0) {
+        LoadAlign(refBaseLow, gRef + BAND * Shape::kHeadDim);
+        LoadAlign(refBaseHigh, gRef + BAND * Shape::kHeadDim + 64);
+    }
     for (uint16_t bandRow = 0; bandRow < computeRows; ++bandRow) {
         constexpr float lower =
             Domain::StoredBound(ExpDomain::kV1Bf16LowerBase2);
@@ -476,14 +527,10 @@ __simd_callee__ inline void ComputeStageV1PlusBand(
         RegTensor<float> kHigh;
         RegTensor<float> expLow;
         RegTensor<float> expHigh;
-        RegTensor<float> refLow;
-        RegTensor<float> refHigh;
         LoadAlign<float, LoadDist::DIST_DINTLV_B32>(
             expLow, expHigh, g + row * Shape::kHeadDim);
-        LoadAlign(refLow, gRef + BAND * Shape::kHeadDim);
-        LoadAlign(refHigh, gRef + BAND * Shape::kHeadDim + 64);
-        Sub(expLow, expLow, refLow, mask);
-        Sub(expHigh, expHigh, refHigh, mask);
+        Sub(expLow, expLow, refBaseLow, mask);
+        Sub(expHigh, expHigh, refBaseHigh, mask);
         ExpPair<CompilePolicy::useExp2>(expLow, expHigh, lower, upper);
         Load128AsFp32(qLow, qHigh, qHat + row * Shape::kHeadDim);
         Load128AsFp32(kLow, kHigh, kHat + row * Shape::kHeadDim);
@@ -718,6 +765,14 @@ __simd_vf__ inline void StageV6Vf(
 
     // 第一阶段只生成三个需要 BF16 舍入的中间结果。所有行完成后统一
     // 建立一次 VEC_STORE->VEC_LOAD 依赖，避免原实现每行两次屏障。
+    // gLast 是 chunk 末行 gate（与 row 无关），提升为循环外一次加载；
+    // 逐行 Sub(lastBase, G[row]) 与原先 Sub(last, G[row]) 数值顺序一致。
+    RegTensor<float> lastBaseLow;
+    RegTensor<float> lastBaseHigh;
+    if (validRows > 0) {
+        LoadAlign(lastBaseLow, gLast);
+        LoadAlign(lastBaseHigh, gLast + 64);
+    }
     for (uint16_t row = 0; row < validRows; ++row) {
         RegTensor<float> qLow;
         RegTensor<float> qHigh;
@@ -729,8 +784,6 @@ __simd_vf__ inline void StageV6Vf(
         RegTensor<float> lastHigh;
         LoadAlign<float, LoadDist::DIST_DINTLV_B32>(
             gateLow, gateHigh, g + row * 128);
-        LoadAlign(lastLow, gLast);
-        LoadAlign(lastHigh, gLast + 64);
         Load128AsFp32(qLow, qHigh, qHat + row * 128);
         Load128AsFp32(kLow, kHigh, kHat + row * 128);
 
@@ -753,8 +806,8 @@ __simd_vf__ inline void StageV6Vf(
         // 第一次舍入先落到最终 kBetaG 物理区，第二阶段再回读 FP32。
         Store128FromFp32(kBetaG + row * 128, kPosLow, kPosHigh);
 
-        Sub(lastLow, lastLow, gateLow, mask);
-        Sub(lastHigh, lastHigh, gateHigh, mask);
+        Sub(lastLow, lastBaseLow, gateLow, mask);
+        Sub(lastHigh, lastBaseHigh, gateHigh, mask);
         ExpPair<CompilePolicy::useExp2>(lastLow, lastHigh, lower, upper);
         Mul(kLow, kLow, lastLow, mask);
         Mul(kHigh, kHigh, lastHigh, mask);
