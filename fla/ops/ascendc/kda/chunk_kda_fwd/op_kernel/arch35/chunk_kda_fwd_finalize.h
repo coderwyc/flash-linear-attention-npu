@@ -666,6 +666,10 @@ private:
         constexpr uint16_t kMte2Event = 0;
         constexpr uint16_t kMte1Event = 0;
         constexpr uint16_t kMmadEvent = 0;
+        // FIX_M event namespace is independent of the M_MTE1/MTE1_M/MTE2_MTE1
+        // events above (all id 0). Used to let the Aqk/VNew L1->L0 copies overlap
+        // with the O Fixpipe, then gate the L0C overwrite by the following Mmad.
+        constexpr uint16_t kFixEvent = 0;
         constexpr uint32_t kL1A0Offset = 0;
         constexpr uint32_t kL1B0Offset = 64 * 128 * sizeof(ElementA);
         constexpr uint32_t kL1A1Offset = kL1B0Offset + 128 * 128 * sizeof(ElementB);
@@ -781,8 +785,17 @@ private:
                 tileMmad(tileL0C, tileL0A0, tileL0B0, curM, curN, static_cast<uint32_t>(K_), true, 0b11);
                 SetFlag<HardEvent::M_MTE1>(kMmadEvent);
                 WaitFlag<HardEvent::M_MTE1>(kMmadEvent);
+                // M_FIX: cube write to L0C must finish before Fixpipe reads it.
+                // (--cce-auto-sync=off: this dependency is otherwise only
+                //  covered by the full drain below; make it explicit.)
+                SetFlag<HardEvent::M_FIX>(kFixEvent);
+                WaitFlag<HardEvent::M_FIX>(kFixEvent);
                 copyL0CToDst(blockO, tileL0C, 0b11);
-                PipeBarrier<PIPE_ALL>();
+                // FIX_M: Fixpipe finished reading L0C into o_. Replace the
+                // PIPE_ALL full drain with a FIX->M event so the Aqk/VNew
+                // L1->L0 MTE1 copies below can overlap with the O Fixpipe;
+                // the second Mmad (which overwrites this L0C) waits on it.
+                SetFlag<HardEvent::FIX_M>(kFixEvent);
 
                 copyL1ToL0A(tileL0A1, tileL1A1);
                 copyL1ToL0B(tileL0B1, tileL1B1);
@@ -790,10 +803,14 @@ private:
                 SetFlag<HardEvent::MTE1_MTE2>(kMte2Event);
                 WaitFlag<HardEvent::MTE1_M>(kMte1Event);
                 WaitFlag<HardEvent::MTE1_MTE2>(kMte2Event);
+                // L0C is reused by the second Mmad: wait until Fixpipe0 drained.
+                WaitFlag<HardEvent::FIX_M>(kFixEvent);
                 tileMmad(tileL0C, tileL0A1, tileL0B1, curM, curN, static_cast<uint32_t>(curT), true, 0b11);
                 SetFlag<HardEvent::M_MTE1>(kMmadEvent);
                 WaitFlag<HardEvent::M_MTE1>(kMmadEvent);
                 copyL0CToDst(blockLocal, tileL0C, 0b11);
+                // Keep the trailing full drain: last Fixpipe must be flushed
+                // before function return (no consumer op left to overlap).
                 PipeBarrier<PIPE_ALL>();
             }
         }
