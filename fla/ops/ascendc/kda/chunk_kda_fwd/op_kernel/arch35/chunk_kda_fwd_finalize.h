@@ -897,28 +897,14 @@ private:
         using CopyL1ToL0B = typename TileCopy::CopyL1ToL0B;
         using TileMmad = Catlass::Gemm::Tile::TileMmadTla<KdaArchTag, ElementA, LayoutTagL1A>;
 
-        constexpr uint16_t kMte1Event0 = 0;
-        constexpr uint16_t kMte1Event1 = 1;
-        constexpr uint16_t kMmadEvent0 = 0;
-        constexpr uint16_t kMmadEvent1 = 1;
+        constexpr uint16_t kMte1Event = 0;
+        constexpr uint16_t kMmadEvent = 0;
         constexpr uint16_t kFixEvent = 0;
         constexpr uint32_t kL1SlotBytes = 96 * 1024;
         constexpr uint32_t kL1A0Offset = 0;
         constexpr uint32_t kL1B0Offset = 64 * 128 * sizeof(ElementA);
         constexpr uint32_t kL1A1Offset = kL1B0Offset + 128 * 128 * sizeof(ElementB);
         constexpr uint32_t kL1B1Offset = kL1A1Offset + 64 * 64 * sizeof(ElementA);
-        // L0A/L0B 各拆两个 plane：Q@H 与 Aqk@VNew 的 L1->L0 搬运落在不同 plane 上，
-        // 第二个 GEMM 的搬运不必等第一个 MMAD 读完同一块 L0，两者可在流水上重叠。
-        // 尺寸取本路径前置条件（K_ == 128、V_ == 128、BT_ == 64，故 curM <= 64、curN <= 128）的上界。
-        // fp32 时 L0B 放不下两份（B0 本身已占满 64KB），此时 kL0DualPlane 为 false，
-        // plane1 退化为 plane0 的别名，执行顺序与改造前完全一致。
-        constexpr uint32_t kL0APlaneBytes = 64 * 128 * sizeof(ElementA);
-        constexpr uint32_t kL0BPlaneBytes = 128 * 128 * sizeof(ElementB);
-        constexpr bool kL0DualPlane =
-            (2 * kL0APlaneBytes <= KdaArchTag::L0A_SIZE) &&
-            (2 * kL0BPlaneBytes <= KdaArchTag::L0B_SIZE);
-        constexpr uint32_t kL0APlaneStride = kL0DualPlane ? kL0APlaneBytes : 0;
-        constexpr uint32_t kL0BPlaneStride = kL0DualPlane ? kL0BPlaneBytes : 0;
         const uint32_t slotBase = slot * kL1SlotBytes;
         const uint32_t curM = static_cast<uint32_t>(curT);
         const uint32_t curN = static_cast<uint32_t>((V_ - nOffset) > 128 ? 128 : (V_ - nOffset));
@@ -931,10 +917,8 @@ private:
             resource.l1Buf.template GetBufferByByte<ElementA>(slotBase + kL1A1Offset);
         LocalTensor<ElementB> l1B1 =
             resource.l1Buf.template GetBufferByByte<ElementB>(slotBase + kL1B1Offset);
-        LocalTensor<ElementA> l0A0 = resource.l0ABuf.template GetBufferByByte<ElementA>(0);
-        LocalTensor<ElementA> l0A1 = resource.l0ABuf.template GetBufferByByte<ElementA>(kL0APlaneStride);
-        LocalTensor<ElementB> l0B0 = resource.l0BBuf.template GetBufferByByte<ElementB>(0);
-        LocalTensor<ElementB> l0B1 = resource.l0BBuf.template GetBufferByByte<ElementB>(kL0BPlaneStride);
+        LocalTensor<ElementA> l0A = resource.l0ABuf.template GetBufferByByte<ElementA>(0);
+        LocalTensor<ElementB> l0B = resource.l0BBuf.template GetBufferByByte<ElementB>(0);
         LocalTensor<ElementC> l0C = resource.l0CBuf.template GetBufferByByte<ElementC>(0);
 
         auto tensorL1A0 = tla::MakeTensor(
@@ -946,13 +930,13 @@ private:
         auto tensorL1B1 = tla::MakeTensor(
             l1B1, tla::MakeLayout<ElementB, LayoutTagL1B>(curT, curN), Catlass::Arch::PositionL1{});
         auto tensorL0A0 = tla::MakeTensor(
-            l0A0, tla::MakeLayout<ElementA, LayoutTagL0A>(curM, K_), Catlass::Arch::PositionL0A{});
+            l0A, tla::MakeLayout<ElementA, LayoutTagL0A>(curM, K_), Catlass::Arch::PositionL0A{});
         auto tensorL0B0 = tla::MakeTensor(
-            l0B0, tla::MakeLayout<ElementB, LayoutTagL0B>(K_, curN), Catlass::Arch::PositionL0B{});
+            l0B, tla::MakeLayout<ElementB, LayoutTagL0B>(K_, curN), Catlass::Arch::PositionL0B{});
         auto tensorL0A1 = tla::MakeTensor(
-            l0A1, tla::MakeLayout<ElementA, LayoutTagL0A>(curM, curT), Catlass::Arch::PositionL0A{});
+            l0A, tla::MakeLayout<ElementA, LayoutTagL0A>(curM, curT), Catlass::Arch::PositionL0A{});
         auto tensorL0B1 = tla::MakeTensor(
-            l0B1, tla::MakeLayout<ElementB, LayoutTagL0B>(curT, curN), Catlass::Arch::PositionL0B{});
+            l0B, tla::MakeLayout<ElementB, LayoutTagL0B>(curT, curN), Catlass::Arch::PositionL0B{});
         auto tensorL0C = tla::MakeTensor(l0C, tla::MakeLayoutL0C(curM, curN), Catlass::Arch::PositionL0C{});
 
         uint32_t localRow = 0;
@@ -986,31 +970,21 @@ private:
         }
         copyL1ToL0A(tileL0A0, tileL1A0);
         copyL1ToL0B(tileL0B0, tileL1B0);
-        SetFlag<HardEvent::MTE1_M>(kMte1Event0);
-        if constexpr (kL0DualPlane) {
-            copyL1ToL0A(tileL0A1, tileL1A1);
-            copyL1ToL0B(tileL0B1, tileL1B1);
-            SetFlag<HardEvent::MTE1_M>(kMte1Event1);
-            SetFlag<HardEvent::MTE1_MTE2>(slot);
-        }
-
-        WaitFlag<HardEvent::MTE1_M>(kMte1Event0);
+        SetFlag<HardEvent::MTE1_M>(kMte1Event);
+        WaitFlag<HardEvent::MTE1_M>(kMte1Event);
         tileMmad(tileL0C, tileL0A0, tileL0B0, curM, curN, static_cast<uint32_t>(K_), true, 0b11);
-        if constexpr (!kL0DualPlane) {
-            SetFlag<HardEvent::M_MTE1>(kMmadEvent0);
-            WaitFlag<HardEvent::M_MTE1>(kMmadEvent0);
-            copyL1ToL0A(tileL0A1, tileL1A1);
-            copyL1ToL0B(tileL0B1, tileL1B1);
-            SetFlag<HardEvent::MTE1_M>(kMte1Event1);
-            SetFlag<HardEvent::MTE1_MTE2>(slot);
-        }
-
+        SetFlag<HardEvent::M_MTE1>(kMmadEvent);
+        WaitFlag<HardEvent::M_MTE1>(kMmadEvent);
         if constexpr (!IsSameType<T, bfloat16_t>::value) {
             copyL0CToDst(blockO, tileL0C, 0b11);
             PipeBarrier<PIPE_ALL>();
         }
 
-        WaitFlag<HardEvent::MTE1_M>(kMte1Event1);
+        copyL1ToL0A(tileL0A1, tileL1A1);
+        copyL1ToL0B(tileL0B1, tileL1B1);
+        SetFlag<HardEvent::MTE1_M>(kMte1Event);
+        SetFlag<HardEvent::MTE1_MTE2>(slot);
+        WaitFlag<HardEvent::MTE1_M>(kMte1Event);
         tileMmad(tileL0C, tileL0A1, tileL0B1, curM, curN, static_cast<uint32_t>(curT),
                  !IsSameType<T, bfloat16_t>::value, 0b11);
         if constexpr (IsSameType<T, bfloat16_t>::value) {
@@ -1023,8 +997,8 @@ private:
                 vNew_[OutputOffset(b, hv, start, nOffset)], l0C, fixParams);
             SetFlag<HardEvent::FIX_M>(kFixEvent);
         } else {
-            SetFlag<HardEvent::M_MTE1>(kMmadEvent1);
-            WaitFlag<HardEvent::M_MTE1>(kMmadEvent1);
+            SetFlag<HardEvent::M_MTE1>(kMmadEvent);
+            WaitFlag<HardEvent::M_MTE1>(kMmadEvent);
             copyL0CToDst(blockLocal, tileL0C, 0b11);
             PipeBarrier<PIPE_ALL>();
         }
