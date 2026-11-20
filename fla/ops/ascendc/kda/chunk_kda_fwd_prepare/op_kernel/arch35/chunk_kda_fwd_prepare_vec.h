@@ -355,10 +355,8 @@ __simd_vf__ inline void StageV0Vf(
         }
     }
 
-    // 确保所有 gate 写回完成（显式 barrier）
-    LocalMemBar<MemType::VEC_STORE, MemType::VEC_LOAD>();
-
     // G 先完整落到 UB，然后在循环外取四个局部参考行。
+    // VEC_STORE→VEC_LOAD barrier：覆盖上方 gate 循环全部写回，再取参考行。
     LocalMemBar<MemType::VEC_STORE, MemType::VEC_LOAD>();
     RegTensor<float> refLow;
     RegTensor<float> refHigh;
