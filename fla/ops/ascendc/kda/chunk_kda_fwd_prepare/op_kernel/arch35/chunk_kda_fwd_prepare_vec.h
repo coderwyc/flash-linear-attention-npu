@@ -159,11 +159,13 @@ __simd_vf__ inline void StageV0Vf(
     __ubuf__ float *betaEff, uint16_t validRows, float epsilon,
     float lowerBound, bool hasDtBias, bool hasALog)
 {
-    // Week 1 P0.3a: 批量同步间隔（每 N 行同步一次，平衡性能与内存安全）
-    // Week 2 优化：调整为 8（从 4 增加到 8），进一步减少同步次数
-    // 调优参数：可选值 2/4/6/8，根据实测选择最优值
-    // 当前值 8：同步次数 64/8=8 次，相比 Week 1（16 次）再减少 50%
-    constexpr uint16_t kSyncBatchSize = 8;
+    // 方案1: 自适应批量同步间隔（每 N 行同步一次，平衡性能与内存安全）。
+    // 演进：Week1 P0.3a 用 4 → Week2 用 8（4→8 实证 T4096 -2.8%）→ 本轮大 chunk 用 16。
+    // 大 chunk(validRows>=64) 用 16（同步次数再减半），小 chunk 保持 8 避免尾块过长驻留。
+    // 注意：8/16 均为 2 的幂，用位掩码代替 % 运算，避免 VF 热循环内出现
+    //       运行期标量整数除法（延迟高，会抵消减少同步的收益）；位与与原取模逐位等价。
+    const uint16_t kSyncBatchSize = (validRows >= 64) ? 16 : 8;
+    const uint16_t kSyncBatchMask = kSyncBatchSize - 1;
 
     using Domain = ExpDomainTraits<CompilePolicy::useExp2>;
     MaskReg mask = CreateMask<float, MaskPattern::ALL>();
@@ -349,7 +351,8 @@ __simd_vf__ inline void StageV0Vf(
         // 原 bug：只在循环结束后同步，导致下一 task 的 Duplicate(carryLow, 0.0F)
         //         可能覆盖 MTE3 正在读取的 g 数据（KDA_FORWARD_LESSONS §7.1）
         // 修复：每隔 kSyncBatchSize 行或最后一行时，执行完整同步闭环
-        if ((row + 1) % kSyncBatchSize == 0 || (row + 1) == validRows) {
+        // 用位掩码判断（等价于 (row+1) % kSyncBatchSize == 0），避免运行期除法
+        if (((row + 1) & kSyncBatchMask) == 0 || (row + 1) == validRows) {
             // 确保 VEC store 完成后才能 VEC load
             LocalMemBar<MemType::VEC_STORE, MemType::VEC_LOAD>();
         }
